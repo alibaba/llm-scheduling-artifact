@@ -6,9 +6,22 @@ from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
 
 from vllm import attention_ops
+from vllm.utils import get_max_shared_memory_bytes
 
-MAX_SEQ_LEN = 4096
-TEST_SEED = 0
+FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
+# This will change depending on the compute capability.
+# - 512 as a buffer
+MAX_SEQ_LEN = get_max_shared_memory_bytes() // FLOAT32_BYTES - 512
+NUM_BLOCKS = 128  # Arbitrary values for testing
+
+DTYPES = [torch.half, torch.bfloat16, torch.float]
+NUM_GEN_SEQS = [7]  # Arbitrary values for testing
+NUM_PREFILL_SEQS = [1, 3, 7]  # Arbitrary values for testing
+NUM_HEADS = [(40, 40), (64, 8)]  # Arbitrary values for testing
+HEAD_SIZES = [64, 80, 96, 112, 128, 256]
+BLOCK_SIZES = [8, 16, 32]
+USE_ALIBI = [False, True]
+SEEDS = [0]
 
 
 def ref_masked_attention(
@@ -166,28 +179,32 @@ def run_single_query_cached_kv_attention(
     dtype: torch.dtype,
     num_kv_heads: int = None,
 ) -> None:
-    qkv = torch.empty(num_tokens,
-                      3,
-                      num_heads,
-                      head_size,
-                      dtype=dtype,
-                      device='cuda')
-    qkv.uniform_(-1e-3, 1e-3)
-    query, _, _ = qkv.unbind(dim=1)
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
 
-    x = 16 // torch.tensor([], dtype=dtype).element_size()
-    key_block_shape = (num_heads, head_size // x, block_size, x)
-    key_cache = torch.empty(size=(num_blocks, *key_block_shape),
-                            dtype=dtype,
-                            device='cuda')
-    key_cache.uniform_(-1e-3, 1e-3)
-    value_block_shape = (num_heads, head_size, block_size)
-    value_cache = torch.empty(size=(num_blocks, *value_block_shape),
-                              dtype=dtype,
-                              device='cuda')
-    value_cache.uniform_(-1e-3, 1e-3)
+    scale = float(1.0 / (head_size**0.5))
+    num_query_heads, num_kv_heads = num_heads
+    query = torch.empty(num_seqs,
+                        num_query_heads,
+                        head_size,
+                        dtype=dtype,
+                        device="cuda")
+    query.uniform_(-scale, scale)
 
-    context_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_tokens)]
+    assert num_query_heads % num_kv_heads == 0
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    head_mapping = torch.repeat_interleave(
+        torch.arange(num_kv_heads, dtype=torch.int32, device="cuda"),
+        num_queries_per_kv)
+    alibi_slopes = None
+    if use_alibi:
+        alibi_slopes = torch.randn(num_query_heads,
+                                   dtype=torch.float,
+                                   device="cuda")
+
+    context_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
+    context_lens[-1] = MAX_SEQ_LEN
     max_context_len = max(context_lens)
     context_lens = torch.tensor(context_lens, dtype=torch.int, device='cuda')
 
@@ -254,6 +271,7 @@ def run_multi_query_kv_attention(
     dtype: torch.dtype,
 ) -> None:
     seq_lens = random.sample(range(1, MAX_SEQ_LEN), num_seqs)
+    seq_lens[-1] = MAX_SEQ_LEN
     num_tokens = sum(seq_lens)
 
     scale = float(1.0 / (head_size**0.5))

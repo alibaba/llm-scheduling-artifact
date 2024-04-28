@@ -200,12 +200,18 @@ class ParallelConfig:
         pipeline_parallel_size: int,
         tensor_parallel_size: int,
         worker_use_ray: bool,
+        instance_parallel_size: int,
+        max_replicas: int,
+        migrate_backend:str,
     ) -> None:
+        self.max_replicas = max_replicas
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.worker_use_ray = worker_use_ray
+        self.instance_parallel_size = instance_parallel_size
+        self.migrate_backend = migrate_backend
 
-        self.world_size = pipeline_parallel_size * tensor_parallel_size
+        self.world_size = pipeline_parallel_size * tensor_parallel_size * max_replicas
         if self.world_size > 1:
             self.worker_use_ray = True
         self._verify_args()
@@ -229,10 +235,40 @@ class SchedulerConfig:
     """
 
     def __init__(self, max_num_batched_tokens: int, max_num_seqs: int,
-                 max_model_len: int) -> None:
+                 max_model_len: int, migrate_strategy: str) -> None:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_seqs = max_num_seqs
-        self.max_model_len = max_model_len
+        # @@@
+        # self.max_model_len = max_model_len
+        self.max_model_len = 16384
+        self.migrate_strategy = migrate_strategy
+
+
+class RequestSchedulerConfig:
+    def __init__(
+            self, 
+            instance_parallel_size: int,
+            load_metric: str,
+            enable_load_control_prefill: bool,
+            prefill_SLO: float,
+            dispatch_strategy: str,
+            migrate_out_threshold: float,
+            migrate_in_threshold: float,
+            scale_strategy: str,
+            scale_up_threshold: float,
+            scale_down_threshold: float,
+            global_dispatch_strategy: str) -> None:
+        self.instance_parallel_size = instance_parallel_size
+        self.load_metric = load_metric
+        self.enable_load_control_prefill = enable_load_control_prefill
+        self.prefill_SLO = prefill_SLO
+        self.dispatch_strategy = dispatch_strategy
+        self.migrate_out_load_threshold = migrate_out_threshold*(-1)
+        self.migrate_in_load_threshold = migrate_in_threshold*(-1)
+        self.scale_strategy = scale_strategy
+        self.scale_up_threshold = scale_up_threshold*(-1)
+        self.scale_down_threshold = scale_down_threshold*(-1)
+        self.global_dispatch_strategy = global_dispatch_strategy
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {

@@ -20,7 +20,7 @@ import asyncio
 import json
 import random
 import time
-from typing import AsyncGenerator, List, Tuple
+from typing import AsyncGenerator, List, Tuple, Dict
 
 import aiohttp
 import numpy as np
@@ -45,37 +45,77 @@ def sample_requests(
         if len(data["conversations"]) >= 2
     ]
     # Only keep the first two turns of each conversation.
-    dataset = [
-        (data["conversations"][0]["value"], data["conversations"][1]["value"])
-        for data in dataset
-    ]
-
+    # dataset = [
+    #     (data["conversations"][0]["value"], data["conversations"][1]["value"])
+    #     for data in dataset
+    # ]
+    new_dataset = []
+    for data in dataset:
+        session_id = data["id"]
+        if len(data["conversations"]) % 2 != 0:
+            continue
+        for i in range(0, len(data["conversations"]), 2):
+            new_dataset.append((session_id, data["conversations"][i]["value"], data["conversations"][i + 1]["value"]))
+    dataset = new_dataset
+    
+    session_ids = [session_id for session_id, _, _ in dataset]
     # Tokenize the prompts and completions.
-    prompts = [prompt for prompt, _ in dataset]
+    # prompts = [prompt for prompt, _ in dataset]
+    prompts = [prompt for _, prompt, _ in dataset]
     prompt_token_ids = tokenizer(prompts).input_ids
-    completions = [completion for _, completion in dataset]
+    # completions = [completion for _, completion in dataset]
+    completions = [completion for _, _, completion in dataset]
     completion_token_ids = tokenizer(completions).input_ids
     tokenized_dataset = []
+    # len(dataset)=201383
     for i in range(len(dataset)):
         output_len = len(completion_token_ids[i])
-        tokenized_dataset.append((prompts[i], prompt_token_ids[i], output_len))
+        tokenized_dataset.append((session_ids[i], prompts[i], prompt_token_ids[i], output_len))
 
     # Filter out too long sequences.
-    filtered_dataset: List[Tuple[str, int, int]] = []
-    for prompt, prompt_token_ids, output_len in tokenized_dataset:
+    filtered_dataset: List[Tuple[str, str, int, int]] = []
+    for session_id, prompt, prompt_token_ids, output_len in tokenized_dataset:
         prompt_len = len(prompt_token_ids)
         if prompt_len < 4 or output_len < 4:
             # Prune too short sequences.
             # This is because TGI causes errors when the input or output length
             # is too short.
             continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
+        # @@@
+        # if prompt_len > 1024 or prompt_len + output_len > 2048:
+        if prompt_len > 1024 or prompt_len + output_len > 16384:
             # Prune too long sequences.
             continue
-        filtered_dataset.append((prompt, prompt_len, output_len))
+        filtered_dataset.append((session_id, prompt, prompt_len, output_len))
 
     # Sample the requests.
-    sampled_requests = random.sample(filtered_dataset, num_requests)
+    # sampled_requests = random.sample(filtered_dataset, num_requests)
+
+    filtered_dataset_dict: Dict[str, List[Tuple[str, str, int, int]]] = {}
+    for i in range(len(filtered_dataset)):
+        session_id = filtered_dataset[i][0]
+        if session_id not in filtered_dataset_dict:
+            filtered_dataset_dict[session_id] = []
+        filtered_dataset_dict[session_id].append(filtered_dataset[i])
+
+    num_session = len(filtered_dataset_dict.keys())
+    selected_session = []
+    num_sampled_request = 0
+    sampling = True
+    sampled_requests = []
+    while sampling:
+        random_idx = random.randint(0, num_session - 1)
+        session_id = list(filtered_dataset_dict.keys())[random_idx]
+        if session_id in selected_session:
+            continue
+        selected_session.append(session_id)
+        for i in range(len(filtered_dataset_dict[session_id])):
+            sampled_requests.append(filtered_dataset_dict[session_id][i])
+            num_sampled_request += 1
+            if num_sampled_request == num_requests:
+                sampling = False
+                break
+    
     return sampled_requests
 
 
@@ -99,6 +139,7 @@ async def get_request(
 async def send_request(
     backend: str,
     api_url: str,
+    session_id: str,
     prompt: str,
     prompt_len: int,
     output_len: int,
@@ -110,12 +151,13 @@ async def send_request(
     headers = {"User-Agent": "Benchmark Client"}
     if backend == "vllm":
         pload = {
+            "session_id": session_id,
             "prompt": prompt,
             "n": 1,
             "best_of": best_of,
             "use_beam_search": use_beam_search,
             "temperature": 0.0 if use_beam_search else 1.0,
-            "top_p": 1.0,
+            "top_k": 1,
             "max_tokens": output_len,
             "ignore_eos": True,
             "stream": False,
@@ -163,8 +205,8 @@ async def benchmark(
 ) -> None:
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
-        prompt, prompt_len, output_len = request
-        task = asyncio.create_task(send_request(backend, api_url, prompt,
+        session_id, prompt, prompt_len, output_len = request
+        task = asyncio.create_task(send_request(backend, api_url, session_id, prompt,
                                                 prompt_len, output_len,
                                                 best_of, use_beam_search))
         tasks.append(task)
@@ -210,7 +252,7 @@ if __name__ == "__main__":
     parser.add_argument("--backend", type=str, default="vllm",
                         choices=["vllm", "tgi"])
     parser.add_argument("--host", type=str, default="localhost")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=8003)
     parser.add_argument("--dataset", type=str, required=True,
                         help="Path to the dataset.")
     parser.add_argument("--tokenizer", type=str, required=True,
@@ -219,7 +261,7 @@ if __name__ == "__main__":
                         help="Generates `best_of` sequences per prompt and "
                              "returns the best one.")
     parser.add_argument("--use-beam-search", action="store_true")
-    parser.add_argument("--num-prompts", type=int, default=1000,
+    parser.add_argument("--num-prompts", type=int, default=300,
                         help="Number of prompts to process.")
     parser.add_argument("--request-rate", type=float, default=float("inf"),
                         help="Number of requests per second. If this is inf, "

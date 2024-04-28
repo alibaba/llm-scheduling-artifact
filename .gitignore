@@ -56,7 +56,7 @@ cover/
 *.pot
 
 # Django stuff:
-*.log
+# *.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -173,3 +173,16 @@ cython_debug/
 
 # Sphinx documentation
 _build/
+
+# datasets
+datasets
+
+# log
+log
+*/results
+*/sim_results
+*.log
+*.bug
+# *.png
+*.nsys-rep
+nohup.out

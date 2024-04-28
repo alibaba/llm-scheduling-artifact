@@ -49,7 +49,9 @@ def sample_requests(
         if prompt_len < 4 or output_len < 4:
             # Prune too short sequences.
             continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
+        # @@@
+        # if prompt_len > 1024 or prompt_len + output_len > 2048:
+        if prompt_len > 1024 or prompt_len + output_len > 16384:
             # Prune too long sequences.
             continue
         filtered_dataset.append((prompt, prompt_len, output_len))
@@ -63,6 +65,7 @@ def run_vllm(
     requests: List[Tuple[str, int, int]],
     model: str,
     tokenizer: str,
+    instance_parallel_size: int,
     tensor_parallel_size: int,
     seed: int,
     n: int,
@@ -72,6 +75,7 @@ def run_vllm(
     llm = LLM(
         model=model,
         tokenizer=tokenizer,
+        instance_parallel_size=instance_parallel_size,
         tensor_parallel_size=tensor_parallel_size,
         seed=seed,
         trust_remote_code=trust_remote_code,
@@ -132,8 +136,10 @@ def run_hf(
         if len(batch) < max_batch_size and i != len(requests) - 1:
             # Check if we can add more requests to the batch.
             _, next_prompt_len, next_output_len = requests[i + 1]
+            # if (max(max_prompt_len, next_prompt_len) + max(
+            #     max_output_len, next_output_len)) <= 2048:
             if (max(max_prompt_len, next_prompt_len) + max(
-                max_output_len, next_output_len)) <= 2048:
+                max_output_len, next_output_len)) <= 16384:
                 # We can add more requests to the batch.
                 continue
 
@@ -170,7 +176,7 @@ def main(args: argparse.Namespace):
 
     if args.backend == "vllm":
         elapsed_time = run_vllm(
-            requests, args.model, args.tokenizer, args.tensor_parallel_size,
+            requests, args.model, args.tokenizer, args.instance_parallel_size, args.tensor_parallel_size,
             args.seed, args.n, args.use_beam_search, args.trust_remote_code)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
@@ -193,7 +199,8 @@ if __name__ == "__main__":
                         default="vllm")
     parser.add_argument("--dataset", type=str, required=True,
                         help="Path to the dataset.")
-    parser.add_argument("--model", type=str, default="facebook/opt-125m")
+    # parser.add_argument("--model", type=str, default="facebook/opt-125m")
+    parser.add_argument("--model", type=str, default="/mnt/wencong.xwc/sunbiao/models/huggingface-models/llama-trained/llama-7b")  
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     parser.add_argument("--n", type=int, default=1,

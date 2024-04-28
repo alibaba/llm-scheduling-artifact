@@ -20,6 +20,8 @@ _POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 
+_INSTANCE_GROUP = None
+
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
 _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = None
@@ -45,6 +47,7 @@ _PIPELINE_GLOBAL_RANKS = None
 _DATA_PARALLEL_GLOBAL_RANKS = None
 
 _ALL_REDUCE_LAUNCHER: Optional['GraphAllReduce'] = None
+_INSTANCE_GLOBAL_RANKS = None
 
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
@@ -110,7 +113,6 @@ def initialize_model_parallel(
         _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank
 
     rank = torch.distributed.get_rank()
-
     # Build the data-parallel groups.
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_GLOBAL_RANKS
@@ -122,7 +124,7 @@ def initialize_model_parallel(
         for j in range(tensor_model_parallel_size):
             ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
             all_data_parallel_group_ranks.append(list(ranks))
-            group = torch.distributed.new_group(ranks)
+            group = torch.distributed.new_group(ranks, backend="nccl")
             if rank in ranks:
                 _DATA_PARALLEL_GROUP = group
                 _DATA_PARALLEL_GLOBAL_RANKS = ranks
@@ -133,7 +135,7 @@ def initialize_model_parallel(
     for i in range(data_parallel_size):
         ranks = [data_parallel_group_ranks[i]
                  for data_parallel_group_ranks in all_data_parallel_group_ranks]
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, backend="nccl")
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
 
@@ -144,10 +146,10 @@ def initialize_model_parallel(
     for i in range(num_tensor_model_parallel_groups):
         ranks = range(i * tensor_model_parallel_size,
                       (i + 1) * tensor_model_parallel_size)
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, backend="nccl")
         if rank in ranks:
+            #
             _TENSOR_MODEL_PARALLEL_GROUP = group
-
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
     global _PIPELINE_MODEL_PARALLEL_GROUP
@@ -163,7 +165,7 @@ def initialize_model_parallel(
         'position embedding group is already initialized'
     for i in range(num_pipeline_model_parallel_groups):
         ranks = range(i, world_size, num_pipeline_model_parallel_groups)
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, backend="nccl")
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
@@ -184,17 +186,25 @@ def initialize_model_parallel(
             embedding_ranks = ranks
             position_embedding_ranks = ranks
 
-        group = torch.distributed.new_group(embedding_ranks)
+        group = torch.distributed.new_group(ranks, backend="nccl")
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
         if rank in ranks:
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
-        group = torch.distributed.new_group(position_embedding_ranks)
+        group = torch.distributed.new_group(ranks, backend="nccl")
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+        
+    global _INSTANCE_GROUP
+    global _INSTANCE_GLOBAL_RANKS
+    assert _INSTANCE_GROUP is None, 'instances group is already initialized'
+    ranks = range(0, world_size)
+    group = torch.distributed.new_group(ranks, backend="gloo")
+    _INSTANCE_GROUP = group
+    _INSTANCE_GLOBAL_RANKS = ranks
 
 def initialize_all_reduce_launcher(
     max_num_tokens: int,
@@ -259,6 +269,11 @@ def get_position_embedding_group():
     assert _POSITION_EMBEDDING_GROUP is not None, \
         'position embedding group is not initialized'
     return _POSITION_EMBEDDING_GROUP
+
+def get_instance_parallel_group():
+    """Get the instance parallel group the caller rank belongs to."""
+    assert _INSTANCE_GROUP is not None, 'instances group is not initialized'
+    return _INSTANCE_GROUP
 
 
 def set_tensor_model_parallel_world_size(world_size):

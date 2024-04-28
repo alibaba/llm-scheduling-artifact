@@ -78,6 +78,22 @@ class BlockSpaceManager:
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
 
+    def get_free_blocks(self, num_required_blocks: int) -> BlockTable:
+        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+        if (num_free_gpu_blocks - num_required_blocks <
+                self.watermark_blocks):
+            return []
+        block_table = []
+        for _ in range(num_required_blocks):
+            block = self.gpu_allocator.allocate()
+            # Set the reference counts of the token blocks.
+            block.ref_count = 1
+            block_table.append(block)
+        return block_table
+
+    def add_block_table(self, block_table: BlockTable, seq_id: int) -> None:
+        self.block_tables[seq_id] = block_table.copy()
+        
     def can_allocate(self, seq_group: SequenceGroup) -> bool:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.

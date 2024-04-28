@@ -1,0 +1,4 @@
+Llumnix outperforms INFaaS++ across all traces in end-to-end request latency by up to 1.5× and 1.6× for mean and P99, respectively. 
+Llumnix achieves significant gains in prefill latency, by up to 7.7× for mean and up to 14.8× for P99, respectively.
+Llumnix also improves the P99 per-token decode latency by up to 2.0×, through migration for load balancing to reduce preemptions
+The reduction is 70.4% on average across all experiments, which translates to an average reduction of 5.4 seconds in the end-to-end request latency

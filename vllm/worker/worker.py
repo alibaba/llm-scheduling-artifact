@@ -1,7 +1,7 @@
 """A GPU worker class."""
 import os
 from typing import Dict, List, Tuple, Optional
-
+import time,threading
 import torch
 import torch.distributed
 
@@ -13,8 +13,10 @@ from vllm.model_executor.parallel_utils.parallel_state import (
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import SequenceData, SequenceGroupMetadata, SequenceOutputs
 from vllm.worker.cache_engine import CacheEngine
-from vllm.utils import get_gpu_memory
+from vllm.logger import init_logger
+from vllm.utils import get_gpu_memory, get_max_shared_memory_bytes
 
+logger = init_logger(__name__)
 
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
@@ -26,18 +28,20 @@ class Worker:
 
     def __init__(
         self,
-        model_config: ModelConfig,
+        # model_config: ModelConfig,
         parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
+        # scheduler_config: SchedulerConfig,
         rank: Optional[int] = None,
         distributed_init_method: Optional[str] = None,
     ) -> None:
-        self.model_config = model_config
+        # self.model_config = model_config
         self.parallel_config = parallel_config
-        self.scheduler_config = scheduler_config
+        # self.scheduler_config = scheduler_config
         self.rank = rank
         self.distributed_init_method = distributed_init_method
 
+        self.model_config = None
+        self.scheduler_config = None
         # Uninitialized cache engine. Will be initialized by
         # self.init_cache_engine().
         self.cache_config = None
@@ -46,24 +50,48 @@ class Worker:
         self.cache_events = None
         self.gpu_cache = None
 
-    def init_model(self):
+    def init_distributed_environment(self) -> int:
         # This env var set by Ray causes exceptions with graph building.
         os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
         # Env vars will be set by Ray.
         self.rank = self.rank if self.rank is not None else int(
             os.getenv("RANK", "-1"))
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        self.device = torch.device(f"cuda:{local_rank}")
+        if self.parallel_config.migrate_backend == "gloo":
+            self.device = torch.device(f"cuda:0")
+        else:
+            self.device = torch.device(f"cuda:{local_rank}")
         if self.rank < 0:
             raise ValueError("Invalid or unspecified rank.")
         torch.cuda.set_device(self.device)
-
         # Initialize the distributed environment.
         _init_distributed_environment(self.parallel_config, self.rank,
                                       self.distributed_init_method)
+        return self.rank
 
+    # def init_model(self):
+        # # This env var set by Ray causes exceptions with graph building.
+        # os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+        # # Env vars will be set by Ray.
+        # self.rank = self.rank if self.rank is not None else int(
+        #     os.getenv("RANK", "-1"))
+        # local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        # self.device = torch.device(f"cuda:{local_rank}")
+        # if self.rank < 0:
+        #     raise ValueError("Invalid or unspecified rank.")
+        # torch.cuda.set_device(self.device)
+
+        # # Initialize the distributed environment.
+        # _init_distributed_environment(self.parallel_config, self.rank,
+        #                               self.distributed_init_method)
+
+    def init_model(self, model_config: ModelConfig, scheduler_config: SchedulerConfig) -> None:
+        self.model_config = model_config
+        self.scheduler_config = scheduler_config
         # Initialize the model.
         set_random_seed(self.model_config.seed)
+        # set device again if use multithread
+        torch.cuda.set_device(self.device)
         self.model = get_model(self.model_config)
         initialize_all_reduce_launcher(
             self.scheduler_config.max_num_batched_tokens,
@@ -132,20 +160,45 @@ class Worker:
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
         torch.cuda.empty_cache()
-
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
         return num_gpu_blocks, num_cpu_blocks
 
-    def init_cache_engine(self, cache_config: CacheConfig) -> None:
+    def init_cache_engine(self, cache_config: CacheConfig, do_migrate_warmup=True) -> None:
         self.cache_config = cache_config
         self.block_size = cache_config.block_size
+        _check_if_can_support_max_seq_len(self.scheduler_config.max_model_len,
+                                          self.block_size)
+
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
                                         self.parallel_config)
         self.cache_events = self.cache_engine.events
         self.gpu_cache = self.cache_engine.gpu_cache
+        if self.parallel_config.max_replicas > 1 and do_migrate_warmup: #do warm up
+            tot_tanks = self.parallel_config.max_replicas*self.parallel_config.pipeline_parallel_size\
+                        *self.parallel_config.tensor_parallel_size
+            if self.rank % 2: 
+                self.cache_engine.recv_gpu_cache((self.rank - 1 + tot_tanks)%tot_tanks,[0])
+                self.cache_engine.send_gpu_cache((self.rank + 1)%tot_tanks,[0])
+            else:
+                self.cache_engine.send_gpu_cache((self.rank + 1)%tot_tanks,[0])
+                self.cache_engine.recv_gpu_cache((self.rank - 1 + tot_tanks)%tot_tanks,[0])
+        logger.info(f"warm up done")
+    
+    def shutdown(self):
+        torch.cuda.synchronize()
+        logger.info("shutdown")
+        del self.model
+        del self.cache_engine
+        del self.gpu_cache
+        torch.cuda.empty_cache()
+        torch.cuda.reset_max_memory_allocated()
 
+    def restart(self):
+        self.init_model(self.model_config, self.scheduler_config)
+        self.init_cache_engine(self.cache_config, do_migrate_warmup=False)
+        
     def _prepare_inputs(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -221,7 +274,6 @@ class Worker:
                 max_num_blocks_per_seq = max(max_num_blocks_per_seq,
                                              len(block_table))
                 context_lens.append(context_len)
-
                 block_number = block_table[position // self.block_size]
                 block_offset = position % self.block_size
                 slot = block_number * self.block_size + block_offset
@@ -258,6 +310,14 @@ class Worker:
         )
         return tokens_tensor, positions_tensor, input_metadata
 
+    def send_gpu_cache(self, rank_offset:int, block_tensor:List[int]):
+        # torch.cuda.nvtx.range_push(f"rank_{self.rank}_send_{len(block_tensor)}")
+        self.cache_engine.send_gpu_cache(self.rank+rank_offset, block_tensor)
+        # torch.cuda.nvtx.range_pop()
+    def recv_gpu_cache(self, rank_offset:int, block_tensor:List[int]):
+        # torch.cuda.nvtx.range_push(f"rank_{self.rank}_recv_{len(block_tensor)}")
+        self.cache_engine.recv_gpu_cache(self.rank+rank_offset, block_tensor)
+        # torch.cuda.nvtx.range_pop()
     @torch.inference_mode()
     def execute_model(
         self,
@@ -293,8 +353,8 @@ class Worker:
         # Prepare input tensors.
         input_tokens, input_positions, input_metadata = self._prepare_inputs(
             seq_group_metadata_list)
-
         # Execute the model.
+        # torch.cuda.nvtx.range_push(f"rank_{self.rank}_inference")
         output = self.model(
             input_ids=input_tokens,
             positions=input_positions,
@@ -302,6 +362,7 @@ class Worker:
             input_metadata=input_metadata,
             cache_events=cache_events,
         )
+        # torch.cuda.nvtx.range_pop()
         return output
 
 
@@ -342,3 +403,24 @@ def _pad_to_alignment(x: List[int], multiple_of: int) -> List[int]:
 
 def _pad_to_max(x: List[int], max_len: int) -> List[int]:
     return x + [0] * (max_len - len(x))
+
+
+def _check_if_can_support_max_seq_len(max_seq_len: int,
+                                      block_size: int) -> None:
+    # Follows the logic in
+    # attention_kernels.cu::single_query_cached_kv_attention_launcher
+    max_shared_mem = get_max_shared_memory_bytes()
+    float32_bytes = torch.finfo(torch.float).bits // 8
+    padded_max_seq_len = (
+        (max_seq_len + block_size - 1) / block_size) * block_size
+    # padded_max_seq_len + extra buffer
+    required_shared_mem = (padded_max_seq_len + 512) * float32_bytes
+    logger.info(f"max_seq_len:{max_seq_len} max_shared_mem:{max_shared_mem} required_shared_mem:{required_shared_mem}")
+    if padded_max_seq_len * float32_bytes > max_shared_mem:
+        raise RuntimeError(
+            f"vLLM cannot currently support max_model_len={max_seq_len} "
+            f"with block_size={block_size} on GPU with compute "
+            f"capability {torch.cuda.get_device_capability()} "
+            f"(required shared memory {required_shared_mem} > "
+            f"available shared memory {max_shared_mem}). "
+            "This will be fixed in a future release.")

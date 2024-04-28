@@ -7,6 +7,7 @@ from vllm import cache_ops
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig
 from vllm.logger import init_logger
 from vllm.utils import in_wsl
+from vllm.model_executor.parallel_utils.parallel_state import get_instance_parallel_group
 
 logger = init_logger(__name__)
 
@@ -138,6 +139,137 @@ class CacheEngine:
         value_caches = [value_cache for _, value_cache in self.gpu_cache]
         # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
         cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
+    def send_gpu_cache_batch(self, dst_rank, send_blocks):
+        key_block_shape = self.get_key_block_shape()
+        value_block_shape = self.get_value_block_shape()
+        dummy_key = torch.empty(
+            size=(len(send_blocks), *key_block_shape),
+            dtype=self.dtype,
+            device="cuda")
+        dummy_value = torch.empty(
+            size=(len(send_blocks), *value_block_shape),
+            dtype=self.dtype,
+            device="cuda")
+        inds_key = torch.zeros_like(dummy_key, dtype=torch.int64)
+        inds_value = torch.zeros_like(dummy_value, dtype=torch.int64)
+        block_tensor_key = torch.tensor(
+            send_blocks, dtype=torch.int64, device="cuda").view(-1, 1, 1, 1, 1)
+        block_tensor_value = torch.tensor(
+            send_blocks, dtype=torch.int64, device="cuda").view(-1, 1, 1, 1)
+        inds_key.add_(block_tensor_key)
+        inds_value.add_(block_tensor_value)
+        for i in range(self.num_layers):
+            torch.gather(self.gpu_cache[i][0], 0, inds_key, out=dummy_key)
+            send_key_op = torch.distributed.P2POp(torch.distributed.isend, dummy_key, dst_rank)
+            torch.gather(self.gpu_cache[i][1], 0, inds_value, out=dummy_value)
+            send_value_op = torch.distributed.P2POp(torch.distributed.isend, dummy_value, dst_rank)
+            reqs = torch.distributed.batch_isend_irecv([send_key_op, send_value_op])
+            for req in reqs:
+                req.wait()
+            # torch.distributed.send(dummy_key, dst_rank)
+            # torch.distributed.send(dummy_value, dst_rank)
+            # torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        # logger.info(f"total gather time:{tot_gather_time*1000}ms")
+    def recv_gpu_cache_batch(self, src_rank, recv_blocks):
+        key_block_shape = self.get_key_block_shape()
+        value_block_shape = self.get_value_block_shape()
+        dummy_key = torch.empty(
+            size=(len(recv_blocks), *key_block_shape),
+            dtype=self.dtype,
+            device="cuda")
+        dummy_value = torch.empty(
+            size=(len(recv_blocks), *value_block_shape),
+            dtype=self.dtype,
+            device="cuda")
+        inds_key = torch.zeros_like(dummy_key, dtype=torch.int64)
+        inds_value = torch.zeros_like(dummy_value, dtype=torch.int64)
+        block_tensor_key = torch.tensor(
+            recv_blocks, dtype=torch.int64, device="cuda").view(-1, 1, 1, 1, 1)
+        block_tensor_value = torch.tensor(
+            recv_blocks, dtype=torch.int64, device="cuda").view(-1, 1, 1, 1)
+        inds_key.add_(block_tensor_key)
+        inds_value.add_(block_tensor_value)
+        for i in range(self.num_layers):
+            recv_key_op = torch.distributed.P2POp(torch.distributed.irecv, dummy_key, src_rank)
+            recv_value_op = torch.distributed.P2POp(torch.distributed.irecv, dummy_value, src_rank)
+            # torch.distributed.recv(dummy_key, src_rank)
+            # torch.distributed.recv(dummy_value, src_rank)
+            reqs = torch.distributed.batch_isend_irecv([recv_key_op, recv_value_op])
+            reqs[0].wait()
+            self.gpu_cache[i][0].scatter_(0, inds_key, dummy_key)
+            reqs[1].wait()
+            self.gpu_cache[i][1].scatter_(0, inds_value, dummy_value)
+            # if i<1:
+            #     logger.info(f"recv layer{i} from rank{src_rank},value{self.gpu_cache[i][1][recv_blocks]}")
+        torch.cuda.synchronize()
+    def send_gpu_cache(self, dst_rank, send_blocks):
+        with torch.cuda.stream(self.cache_stream):
+            group = None
+            if self.parallel_config.migrate_backend == "gloo":
+                group = get_instance_parallel_group()
+            key_block_shape = self.get_key_block_shape()
+            value_block_shape = self.get_value_block_shape()
+            dummy_key = torch.empty(
+                size=(len(send_blocks), *key_block_shape),
+                dtype=self.dtype,
+                device="cuda")
+            dummy_value = torch.empty(
+                size=(len(send_blocks), *value_block_shape),
+                dtype=self.dtype,
+                device="cuda")
+            inds_key = torch.zeros_like(dummy_key, dtype=torch.int64)
+            inds_value = torch.zeros_like(dummy_value, dtype=torch.int64)
+            block_tensor_key = torch.tensor(
+                send_blocks, dtype=torch.int64, device="cuda").view(-1, 1, 1, 1, 1)
+            block_tensor_value = torch.tensor(
+                send_blocks, dtype=torch.int64, device="cuda").view(-1, 1, 1, 1)
+            inds_key.add_(block_tensor_key)
+            inds_value.add_(block_tensor_value)
+            for i in range(self.num_layers):
+                torch.gather(self.gpu_cache[i][0], 0, inds_key, out=dummy_key)
+                torch.gather(self.gpu_cache[i][1], 0, inds_value, out=dummy_value)
+                if self.parallel_config.migrate_backend == "nccl":
+                    torch.distributed.send(dummy_key, dst_rank, group=group)
+                    torch.distributed.send(dummy_value, dst_rank, group=group)
+                else:
+                    torch.distributed.send(dummy_key.cpu(), dst_rank, group=group)
+                    torch.distributed.send(dummy_value.cpu(), dst_rank, group=group)
+        torch.cuda.Stream.synchronize(self.cache_stream)
+
+    def recv_gpu_cache(self, src_rank, recv_blocks):
+        with torch.cuda.stream(self.cache_stream):
+            group = None
+            if self.parallel_config.migrate_backend == "gloo":
+                group = get_instance_parallel_group()
+            key_block_shape = self.get_key_block_shape()
+            value_block_shape = self.get_value_block_shape()
+            dummy_key = torch.empty(
+                size=(len(recv_blocks), *key_block_shape),
+                dtype=self.dtype,
+                device="cuda" if self.parallel_config.migrate_backend == "nccl" else "cpu")
+            dummy_value = torch.empty(
+                size=(len(recv_blocks), *value_block_shape),
+                dtype=self.dtype,
+                device="cuda" if self.parallel_config.migrate_backend == "nccl" else "cpu")
+            inds_key = torch.zeros_like(dummy_key, dtype=torch.int64, device="cuda")
+            inds_value = torch.zeros_like(dummy_value, dtype=torch.int64, device="cuda")
+            block_tensor_key = torch.tensor(
+                recv_blocks, dtype=torch.int64, device="cuda").view(-1, 1, 1, 1, 1)
+            block_tensor_value = torch.tensor(
+                recv_blocks, dtype=torch.int64, device="cuda").view(-1, 1, 1, 1)
+            inds_key.add_(block_tensor_key)
+            inds_value.add_(block_tensor_value)
+            for i in range(self.num_layers):
+                torch.distributed.recv(dummy_key, src_rank, group=group)
+                torch.distributed.recv(dummy_value, src_rank, group=group)
+                if self.parallel_config.migrate_backend == "nccl":
+                    self.gpu_cache[i][0].scatter_(0, inds_key, dummy_key)
+                    self.gpu_cache[i][1].scatter_(0, inds_value, dummy_value)
+                else:
+                    self.gpu_cache[i][0].scatter_(0, inds_key, dummy_key.cuda())
+                    self.gpu_cache[i][1].scatter_(0, inds_value, dummy_value.cuda())
+        torch.cuda.Stream.synchronize(self.cache_stream)
 
     @staticmethod
     def get_cache_block_size(

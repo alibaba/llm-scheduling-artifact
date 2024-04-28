@@ -37,6 +37,7 @@ def get_tokenizer(
             *args,
             trust_remote_code=trust_remote_code,
             **kwargs)
+        print(tokenizer)
     except TypeError as e:
         # The LLaMA tokenizer causes a protobuf error in some environments.
         err_msg = (

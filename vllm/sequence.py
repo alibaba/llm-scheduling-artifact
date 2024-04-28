@@ -1,7 +1,8 @@
 """Sequence and its related classes."""
 import copy
 import enum
-from typing import Dict, List, Optional, Union
+import time
+from typing import Dict, List, Tuple, Optional, Union
 
 from vllm.block import LogicalTokenBlock
 from vllm.sampling_params import SamplingParams
@@ -16,6 +17,7 @@ class SequenceStatus(enum.Enum):
     FINISHED_LENGTH_CAPPED = enum.auto()
     FINISHED_ABORTED = enum.auto()
     FINISHED_IGNORED = enum.auto()
+    FINISHED_MIGRATED = enum.auto()
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
@@ -24,6 +26,7 @@ class SequenceStatus(enum.Enum):
             SequenceStatus.FINISHED_LENGTH_CAPPED,
             SequenceStatus.FINISHED_ABORTED,
             SequenceStatus.FINISHED_IGNORED,
+            SequenceStatus.FINISHED_MIGRATED
         ]
 
     @staticmethod
@@ -36,6 +39,8 @@ class SequenceStatus(enum.Enum):
             finish_reason = "abort"
         elif status == SequenceStatus.FINISHED_IGNORED:
             finish_reason = "length"
+        elif status == SequenceStatus.FINISHED_MIGRATED:
+            finish_reason = "migrate"
         else:
             finish_reason = None
         return finish_reason
@@ -184,6 +189,23 @@ class Sequence:
                 f"status={self.status.name}, "
                 f"num_blocks={len(self.logical_token_blocks)})")
 
+class SequenceEvent(enum.Enum):
+    PREFILL = enum.auto()
+    KILLED = enum.auto()
+    FINISHED = enum.auto()
+    MIGRATE_IN = enum.auto()
+
+    @staticmethod
+    def get_event(event: "SequenceEvent") -> str:
+        if event == SequenceEvent.PREFILL:
+            return "prefill"
+        elif event == SequenceEvent.KILLED:
+            return "killed"
+        elif event == SequenceEvent.FINISHED:
+            return "finished"
+        elif event == SequenceEvent.MIGRATE_IN:
+            return "migrate_in"
+        return None
 
 class SequenceGroup:
     """A group of sequences that are generated from the same prompt.
@@ -201,12 +223,37 @@ class SequenceGroup:
         seqs: List[Sequence],
         sampling_params: SamplingParams,
         arrival_time: float,
+        priority_type: int,
     ) -> None:
         self.request_id = request_id
         self.seqs = seqs
         self.sampling_params = sampling_params
         self.arrival_time = arrival_time
+        self.total_inference_time = 0
+        self.event_timeline: List[Tuple[float, SequenceEvent]] = []
+        self.priority_type = priority_type
+        
+    def get_max_num_running_seqs(self) -> int:
+        """The maximum number of sequences running in parallel in the remaining
+        lifetime of the request."""
+        if self.sampling_params.use_beam_search:
+            # For beam search, maximally there will always be `best_of` beam
+            # candidates running in the future.
+            return self.sampling_params.best_of
+        else:
+            if self.sampling_params.best_of > self.num_seqs():
+                # At prompt stage, the sequence group is not yet filled up
+                # and only have one sequence running. However, in the
+                # generation stage, we will have `best_of` sequences running.
+                return self.sampling_params.best_of
+            # At sampling stages, return the number of actual sequences
+            # running.
+            return self.num_seqs(status=SequenceStatus.RUNNING)
 
+    def add_event(self, event: SequenceEvent):
+        timestamp = time.time()
+        self.event_timeline.append((timestamp, event))
+        
     def get_seqs(
         self,
         status: Optional[SequenceStatus] = None,
