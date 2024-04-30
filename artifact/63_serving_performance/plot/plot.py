@@ -217,8 +217,8 @@ def validate_figure11_claims_paper():
         out_file.write("Decode Mean outperforms up to: {:.2f}x\n".format(max(decode_mean_improved_ratios)))
         out_file.write("Decode P99 outperforms up to: {:.2f}x\n".format(max(decode_P99_improved_ratios)))
         out_file.write("Preemption Loss(s):\n")
-        out_file.write("Preemption Loss average reduction ratio: {:.2f}%\n".format(max(preemption_loss_reduced_ratios) * 100))
-        out_file.write("Preemption Loss average reduction values: {:.2f}s\n".format(max(preemption_loss_reduced_values)))
+        out_file.write("Preemption Loss average reduction ratio: {:.2f}%\n".format(np.mean(preemption_loss_reduced_ratios) * 100))
+        out_file.write("Preemption Loss average reduction values: {:.2f}s\n".format(np.mean(preemption_loss_reduced_values)))
 
 
 def plot_one_trace(trace, axs, qps_list, infaaspp_latency_dict, llumnix_latency_dict, round_robin_latency_dict=None):
