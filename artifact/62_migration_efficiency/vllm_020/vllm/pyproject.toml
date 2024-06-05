@@ -2,7 +2,7 @@
 requires = [
     "ninja",
     "packaging",
-    "setuptools",
+    "setuptools == 69.5.1",
     "torch == 2.0.1",
     "wheel",
 ]
